@@ -11,6 +11,7 @@ import java.util.TimeZone
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,7 +26,8 @@ import okio.ByteString
  */
 object EdgeTtsProtocol {
     const val TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    const val CHROMIUM_FULL_VERSION = "130.0.2849.68"
+    const val CHROMIUM_FULL_VERSION = "143.0.3650.75"
+    const val CHROMIUM_MAJOR_VERSION = "143"
     private const val WIN_EPOCH_SECONDS = 11_644_473_600L
 
     const val WS_URL =
@@ -159,6 +161,7 @@ class EdgeTtsEngine(
     private var socket: WebSocket? = null
     private var player: MediaPlayer? = null
     private var edgeDownUntil = 0L
+    private var clockSkewMs = 0L
     private var fallback: TtsEngine? = null
     private var fallbackActive = false
 
@@ -177,16 +180,19 @@ class EdgeTtsEngine(
 
     override fun speak(utteranceId: String, text: String) {
         stopPlayback()
-        val sentence = text
         val gen = ++generation
-        val now = System.currentTimeMillis()
-        if (now < edgeDownUntil) {
-            speakWithFallback(utteranceId, sentence)
+        if (System.currentTimeMillis() < edgeDownUntil) {
+            speakWithFallback(gen, utteranceId, text)
             return
         }
         fallbackActive = false
-        val (lang, voice) = EdgeTtsProtocol.voiceFor(text, Locale.getDefault())
-        val ssml = EdgeTtsProtocol.buildSsml(text, lang, voice, rate)
+        connect(gen, utteranceId, text, retryOnSkew = true)
+    }
+
+    private fun connect(gen: Int, utteranceId: String, sentence: String, retryOnSkew: Boolean) {
+        val now = System.currentTimeMillis() + clockSkewMs
+        val (lang, voice) = EdgeTtsProtocol.voiceFor(sentence, Locale.getDefault())
+        val ssml = EdgeTtsProtocol.buildSsml(sentence, lang, voice, rate)
         val audio = ByteArrayOutputStream()
         val requestId = UUID.randomUUID().toString().replace("-", "")
         val url = EdgeTtsProtocol.WS_URL +
@@ -202,9 +208,9 @@ class EdgeTtsEngine(
             .header(
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+                    "(KHTML, like Gecko) Chrome/${EdgeTtsProtocol.CHROMIUM_MAJOR_VERSION}.0.0.0 " +
+                    "Safari/537.36 Edg/${EdgeTtsProtocol.CHROMIUM_MAJOR_VERSION}.0.0.0"
             )
-            .header("Accept-Encoding", "gzip, deflate, br")
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("Cookie", "muid=" + UUID.randomUUID().toString().replace("-", "").uppercase())
             .build()
@@ -225,7 +231,7 @@ class EdgeTtsEngine(
                     val bytes = audio.toByteArray()
                     scope.launch {
                         if (gen != generation) return@launch
-                        if (bytes.isEmpty()) failOver(utteranceId, sentence)
+                        if (bytes.isEmpty()) failOver(gen, utteranceId, sentence)
                         else play(gen, utteranceId, bytes)
                     }
                 }
@@ -238,26 +244,58 @@ class EdgeTtsEngine(
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 if (finished) return
                 finished = true
+                // A 403 with a server Date header usually means this phone's
+                // clock is off: adopt the server's time and retry once.
+                val serverTime = if (response?.code == 403) {
+                    parseHttpDate(response.header("Date"))
+                } else {
+                    null
+                }
                 scope.launch {
-                    if (gen == generation) failOver(utteranceId, sentence)
+                    if (gen != generation) return@launch
+                    if (retryOnSkew && serverTime != null) {
+                        clockSkewMs = serverTime - System.currentTimeMillis()
+                        connect(gen, utteranceId, sentence, retryOnSkew = false)
+                    } else {
+                        failOver(gen, utteranceId, sentence)
+                    }
                 }
             }
         })
     }
 
-    private fun failOver(utteranceId: String, sentence: String) {
-        edgeDownUntil = System.currentTimeMillis() + EDGE_RETRY_COOLDOWN_MS
-        speakWithFallback(utteranceId, sentence)
+    private fun parseHttpDate(value: String?): Long? {
+        if (value == null) return null
+        return try {
+            val fmt = java.text.SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US)
+            fmt.parse(value)?.time
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    private fun speakWithFallback(utteranceId: String, text: String) {
+    private fun failOver(gen: Int, utteranceId: String, sentence: String) {
+        edgeDownUntil = System.currentTimeMillis() + EDGE_RETRY_COOLDOWN_MS
+        speakWithFallback(gen, utteranceId, sentence)
+    }
+
+    private fun speakWithFallback(gen: Int, utteranceId: String, sentence: String) {
         val engine = fallback ?: fallbackFactory().also {
             it.setListener(listener)
             it.setRate(rate)
             fallback = it
         }
         fallbackActive = true
-        engine.speak(utteranceId, text)
+        // The device engine starts asynchronously: wait (up to ~6 s) for it
+        // instead of speaking into an engine that isn't ready yet.
+        scope.launch {
+            var waited = 0
+            while (!engine.isReady && waited < FALLBACK_READY_WAIT_MS && gen == generation) {
+                delay(200)
+                waited += 200
+            }
+            if (gen == generation) engine.speak(utteranceId, sentence)
+        }
     }
 
     private fun play(gen: Int, utteranceId: String, mp3: ByteArray) {
@@ -323,5 +361,6 @@ class EdgeTtsEngine(
 
     companion object {
         const val EDGE_RETRY_COOLDOWN_MS = 60_000L
+        const val FALLBACK_READY_WAIT_MS = 6_000
     }
 }
