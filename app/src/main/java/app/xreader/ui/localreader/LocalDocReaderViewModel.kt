@@ -19,6 +19,7 @@ import app.xreader.data.engine.ReadiumEpubSession
 import app.xreader.data.prefs.settingsDataStore
 import org.readium.r2.shared.publication.services.positionsByReadingOrder
 import app.xreader.data.reader.AndroidTtsEngine
+import app.xreader.data.reader.EdgeTtsEngine
 import app.xreader.data.reader.ReadAloudController
 import app.xreader.data.reader.TtsEngine
 import app.xreader.di.AppContainer
@@ -357,7 +358,9 @@ class LocalDocReaderViewModel(
      * inside the [readAloud] lazy — never on the open path.
      */
     internal var ttsEngineFactory: () -> TtsEngine = {
-        AndroidTtsEngine(container.applicationContext, viewModelScope)
+        EdgeTtsEngine(container.applicationContext, viewModelScope) {
+            AndroidTtsEngine(container.applicationContext, viewModelScope)
+        }
     }
 
     private val readAloud: ReadAloudController by lazy {

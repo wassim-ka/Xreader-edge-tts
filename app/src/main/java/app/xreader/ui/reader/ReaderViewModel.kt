@@ -10,6 +10,7 @@ import app.xreader.data.db.Chapter
 import app.xreader.data.db.Highlight
 import app.xreader.data.db.ReadingProgress
 import app.xreader.data.reader.AndroidTtsEngine
+import app.xreader.data.reader.EdgeTtsEngine
 import app.xreader.data.reader.MlKitEyeTracker
 import app.xreader.data.reader.OverlayPlayer
 import app.xreader.data.reader.ReadAloudController
@@ -318,7 +319,9 @@ class ReaderViewModel(
     // -- Read-aloud (lazy: the TTS engine initialises on first use) ---------
     private val readAloudLazy = lazy {
         ReadAloudController(
-            engine = AndroidTtsEngine(container.applicationContext, viewModelScope),
+            engine = EdgeTtsEngine(container.applicationContext, viewModelScope) {
+                AndroidTtsEngine(container.applicationContext, viewModelScope)
+            },
             scope = viewModelScope
         ).also { controller ->
             controller.onChapterFinished = {
